@@ -115,48 +115,13 @@ def get_space_by_name(name):
             return {"id": item["id"], "slug": item.get("slug")}
     return None
 
-
-def create_space(name):
-    """Create a new space, return {id, slug}."""
-    slug = name.lower().replace(" ", "-").replace("_", "-")
-    print(f"  Creating space '{name}' (slug: {slug})...")
-    data = docmost_request("POST", "/api/spaces/create", {
-        "name": name, "slug": slug,
-    })
-
-    # Debug: show exactly what the server returned, so we can see the real shape.
-    print(f"  DEBUG create_space response: {data}")
-
-    # Docmost's response shape can vary between versions / wrap the object
-    # (e.g. under "space" or "data"). Try the common possibilities before
-    # giving up.
-    if isinstance(data, dict):
-        if "id" in data:
-            return {"id": data["id"], "slug": data.get("slug", slug)}
-        for key in ("space", "data"):
-            inner = data.get(key)
-            if isinstance(inner, dict) and "id" in inner:
-                return {"id": inner["id"], "slug": inner.get("slug", slug)}
-
-    # Some Docmost versions return only a success message without the
-    # created entity. In that case the space usually *was* created, so
-    # fetch it back by name/slug instead of failing.
-    print("  WARNING: create response had no 'id' field, looking the space up instead...")
-    space = get_space_by_name(name)
-    if space:
-        return space
-
-    print("  ERROR: Space creation appears to have failed (no id, and not found on lookup).")
-    print(f"  Raw response was: {data}")
-    sys.exit(1)
-
-
 def get_or_create_space(name):
     space = get_space_by_name(name)
     if space:
         print(f"  Using existing space '{name}' (id: {space['id']})")
         return space
-    return create_space(name)
+    print(f"Check if the space {name} exists")
+    sys.exit(1)
 
 
 def list_pages(space_id, parent_page_id=None):
