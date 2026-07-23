@@ -24,6 +24,11 @@ AZURE_PAT = os.getenv("AZURE_PAT")
 DOCMOST_URL = os.getenv("DOCMOST_URL")
 # Create in Docmost: Settings -> API keys (under Account) -> Create API Key
 DOCMOST_API_KEY = os.getenv("DOCMOST_API_KEY")
+
+# Paths
+WIKI_SOURCE_PATH = os.getenv("WIKI_SOURCE_PATH")
+WIKI_SOURCE_PATH = WIKI_SOURCE_PATH.replace(" ", "-")
+WIKI_DEST_PATH = os.getenv("WIKI_DEST_PATH")
 # ============================================================
 # Azure DevOps API
 # ============================================================
@@ -253,18 +258,13 @@ def import_file(space_id, parent_page_id, wiki_file_path, relative_path):
 
 def main():
 
-    source = "-".join(input("\nWhat to import from Azure DevOps Wiki?\n"
-                   "  (leave empty for entire wiki, or enter path like 'folder/sub/file.md' or 'folder/sub_folder')\n> ").strip().split())
-
-    dest = input("\nWhere to import in Docmost?\n"
-                 "  (format: Space/Page/Subpage  e.g. 'Engineering Wiki/Onboarding')\n> ").strip()
-    if not dest:
+    if not WIKI_DEST_PATH:
         print("ERROR: Destination path is required.")
         sys.exit(1)
 
     print("\nFetching wiki file list...")
     try:
-        files = fetch_wiki_tree(source)
+        files = fetch_wiki_tree(WIKI_SOURCE_PATH)
     except requests.exceptions.RequestException as e:
         print(f"ERROR: Cannot connect to Azure DevOps: {e}")
         print("Check that AZURE_PAT, AZURE_ORG, AZURE_PROJECT are correct.")
@@ -285,13 +285,13 @@ def main():
         sys.exit(1)
 
     print("\nResolving destination path...")
-    space_id, parent_page_id = resolve_destination_path(dest)
+    space_id, parent_page_id = resolve_destination_path(WIKI_DEST_PATH)
 
-    source_normalized = source.strip("/") + "/" if source and not source.endswith(".md") else source
+    source_normalized = WIKI_SOURCE_PATH.strip("/") + "/" if WIKI_SOURCE_PATH and not WIKI_SOURCE_PATH.endswith(".md") else WIKI_SOURCE_PATH
 
     skip_files = set()
-    if source and not source.endswith(".md"):
-        source_root = source.strip("/").split("/")[0]
+    if WIKI_SOURCE_PATH and not WIKI_SOURCE_PATH.endswith(".md"):
+        source_root = WIKI_SOURCE_PATH.strip("/").split("/")[0]
 
         companion_content = None
         companion_path = f"/{source_root}.md"
