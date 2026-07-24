@@ -280,6 +280,10 @@ def import_file(space_id, parent_page_id, wiki_file_path, relative_path):
     existing = find_page_by_title(child_pages, title)
 
     if existing:
+        # We already checked for conflicts before starting the import, so
+        # this should not normally happen. Treat it as a safety net (e.g.
+        # someone/something created the page in the meantime) rather than
+        # silently overwriting anything.
         print(f"  SKIPPED (page already exists, not overwriting): {wiki_file_path}")
         return "skipped"
 
@@ -327,10 +331,13 @@ def main():
 
     skip_files = set()
     if WIKI_SOURCE_PATH and not WIKI_SOURCE_PATH.endswith(".md"):
-        source_root = WIKI_SOURCE_PATH.strip("/").split("/")[0]
+        source_clean = WIKI_SOURCE_PATH.strip("/")
+        source_segments = source_clean.split("/")
+        source_root = source_segments[-1]  # the actual folder being imported
+        source_parent_dir = "/".join(source_segments[:-1])  # sibling dir of the companion .md
 
         companion_content = None
-        companion_path = f"/{source_root}.md"
+        companion_path = f"/{source_parent_dir}/{source_root}.md" if source_parent_dir else f"/{source_root}.md"
         try:
             desc_data = azure_request("items", {
                 "path": companion_path,
@@ -344,17 +351,29 @@ def main():
         except requests.exceptions.RequestException:
             pass
 
-        root_children = list_pages(space_id, parent_page_id)
-        found = find_page_by_title(root_children, source_root)
-        if found:
-            if companion_content:
-                print(f"  Container '{source_root}' already exists, keeping its current content (not overwriting).")
-            parent_page_id = found["id"]
+        dest_last_segment = WIKI_DEST_PATH.strip("/").split("/")[-1] if WIKI_DEST_PATH.strip("/") else ""
+        dest_already_is_container = (
+            dest_last_segment.replace(" ", "-").lower() == source_root.replace(" ", "-").lower()
+        )
+
+        if dest_already_is_container:
+            # WIKI_DEST_PATH already ends with the source folder's own name
+            # (e.g. ".../Vendors/Hardware-Resources" importing "Hardware-Resources"),
+            # so the page resolve_destination_path() already found/created IS
+            # the container -- don't create another one nested inside it.
+            print(f"  Destination already ends with '{source_root}', using it as the container (no extra nesting).")
         else:
-            content = companion_content if companion_content else f"# {source_root}\n\n"
-            print(f"  Creating container page '{source_root}'...")
-            new_page = create_page(space_id, source_root, content, parent_page_id)
-            parent_page_id = new_page["id"]
+            root_children = list_pages(space_id, parent_page_id)
+            found = find_page_by_title(root_children, source_root)
+            if found:
+                if companion_content:
+                    print(f"  Container '{source_root}' already exists, keeping its current content (not overwriting).")
+                parent_page_id = found["id"]
+            else:
+                content = companion_content if companion_content else f"# {source_root}\n\n"
+                print(f"  Creating container page '{source_root}'...")
+                new_page = create_page(space_id, source_root, content, parent_page_id)
+                parent_page_id = new_page["id"]
 
     print("\nChecking for existing pages that would be overwritten...")
     conflicts = find_conflicting_pages(space_id, parent_page_id, files, source_normalized, skip_files)
