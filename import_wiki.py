@@ -178,17 +178,54 @@ def create_page(space_id, title, content, parent_page_id=None):
     return data
 
 
-def update_page(page_id, title, content):
-    """Update an existing page."""
-    body = {
-        "pageId": page_id,
-        "title": title,
-        "content": content,
-        "format": "markdown",
-        "operation": "replace",
-    }
-    data = docmost_request("POST", "/api/pages/update", body)
-    return data
+def find_conflicting_pages(space_id, parent_page_id, files, source_normalized, skip_files):
+    """
+    Dry-run check (read-only, creates nothing): for every file we are about
+    to import, walk the destination page tree and see if a page with the
+    same title already exists there. Returns a list of wiki file paths that
+    would collide with an existing Docmost page.
+    """
+    conflicts = []
+    children_cache = {}
+
+    def get_children(pid):
+        key = pid or "__root__"
+        if key not in children_cache:
+            children_cache[key] = list_pages(space_id, pid)
+        return children_cache[key]
+
+    for wiki_file in files:
+        if wiki_file in skip_files:
+            continue
+
+        relative_path = wiki_file.lstrip("/")
+        if source_normalized and relative_path.startswith(source_normalized):
+            relative_path = relative_path[len(source_normalized):]
+        elif source_normalized:
+            continue
+
+        title = os.path.splitext(os.path.basename(wiki_file))[0]
+        parent = parent_page_id
+
+        rel_dir = os.path.dirname(relative_path)
+        folder_missing = False
+        if rel_dir:
+            for part in rel_dir.replace("\\", "/").split("/"):
+                found = find_page_by_title(get_children(parent), part)
+                if found:
+                    parent = found["id"]
+                else:
+                    # Intermediate folder page doesn't exist yet, so the
+                    # leaf page under it can't exist either -> no conflict.
+                    folder_missing = True
+                    break
+        if folder_missing:
+            continue
+
+        if find_page_by_title(get_children(parent), title):
+            conflicts.append(wiki_file)
+
+    return conflicts
 
 
 def resolve_destination_path(dest_path):
@@ -243,13 +280,12 @@ def import_file(space_id, parent_page_id, wiki_file_path, relative_path):
     existing = find_page_by_title(child_pages, title)
 
     if existing:
-        print(f"  Updating: {wiki_file_path}")
-        update_page(existing["id"], title, content)
-        return "updated"
-    else:
-        print(f"  Creating: {wiki_file_path}")
-        create_page(space_id, title, content, parent)
-        return "created"
+        print(f"  SKIPPED (page already exists, not overwriting): {wiki_file_path}")
+        return "skipped"
+
+    print(f"  Creating: {wiki_file_path}")
+    create_page(space_id, title, content, parent)
+    return "created"
 
 
 # ============================================================
@@ -312,8 +348,7 @@ def main():
         found = find_page_by_title(root_children, source_root)
         if found:
             if companion_content:
-                print(f"  Updating container '{source_root}' with companion content...")
-                update_page(found["id"], source_root, companion_content)
+                print(f"  Container '{source_root}' already exists, keeping its current content (not overwriting).")
             parent_page_id = found["id"]
         else:
             content = companion_content if companion_content else f"# {source_root}\n\n"
@@ -321,7 +356,18 @@ def main():
             new_page = create_page(space_id, source_root, content, parent_page_id)
             parent_page_id = new_page["id"]
 
-    stats = {"created": 0, "updated": 0, "errors": 0}
+    print("\nChecking for existing pages that would be overwritten...")
+    conflicts = find_conflicting_pages(space_id, parent_page_id, files, source_normalized, skip_files)
+    if conflicts:
+        print("\nERROR: The following page(s) already exist in Docmost. "
+              "Nothing was imported, to avoid overwriting existing content:")
+        for f in conflicts:
+            print(f"  - {f}")
+        print("\nRename/move the conflicting page(s) in Docmost (or change WIKI_DEST_PATH) and re-run.")
+        sys.exit(1)
+    print("  No conflicts found.")
+
+    stats = {"created": 0, "skipped": 0, "errors": 0}
     for wiki_file in files:
         if wiki_file in skip_files:
             print(f"  Skipping (used as container): {wiki_file}")
@@ -342,7 +388,7 @@ def main():
 
     print("IMPORT COMPLETE")
     print(f"  Created:  {stats['created']}")
-    print(f"  Updated:  {stats['updated']}")
+    print(f"  Skipped:  {stats['skipped']}")
     print(f"  Errors:   {stats['errors']}")
 
 
