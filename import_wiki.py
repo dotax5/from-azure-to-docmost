@@ -2,9 +2,11 @@
 """
 Import Azure DevOps Wiki pages into Docmost
 """
-
+import urllib.parse
 import os
 import sys
+from email.quoprimime import quote
+
 from dotenv import load_dotenv
 import requests
 
@@ -60,26 +62,40 @@ def azure_request(path, params=None):
 def fetch_wiki_tree(path_prefix=""):
     """Fetch all files from Azure DevOps Wiki repo under given path."""
     scope = path_prefix or "/"
-    data = azure_request("items", {
-        "scopePath": scope,
-        "recursionLevel": "Full",
-        "api-version": "6.0",
-    })
+    try:
+        data = azure_request("items", {
+            "scopePath": scope,
+            "recursionLevel": "Full",
+            "api-version": "6.0",
+        })
+    except requests.exceptions.HTTPError:
+        scope = scope.replace("-", "%2D")
+        data = azure_request("items", {
+            "scopePath": scope,
+            "recursionLevel": "Full",
+            "api-version": "6.0",
+        })
     items = data.get("value", [])
     files = []
     for item in items:
         if item.get("gitObjectType") == "blob" and item["path"].endswith(".md"):
-            files.append(item["path"])
+            files.append(urllib.parse.unquote(item["path"]))
     return sorted(set(files))
 
 
 def fetch_file_content(file_path):
-    """Get the raw content of a file from Azure DevOps Wiki repo."""
-    data = azure_request("items", {
-        "path": file_path,
-        "includeContent": "true",
-        "api-version": "6.0",
-    })
+    try:
+        data = azure_request("items", {
+            "path": file_path,
+            "includeContent": "true",
+            "api-version": "6.0",
+        })
+    except requests.exceptions.HTTPError:
+        data = azure_request("items", {
+            "path": file_path.replace("-", "%2D"),
+            "includeContent": "true",
+            "api-version": "6.0",
+        })
     return data.get("content", "")
 
 
@@ -367,6 +383,13 @@ def main():
         try:
             desc_data = azure_request("items", {
                 "path": companion_path,
+                "includeContent": "true",
+                "api-version": "6.0",
+            })
+        except requests.exceptions.HTTPError:
+            encoded_path = companion_path.replace("-", "%2D")
+            desc_data = azure_request("items", {
+                "path": encoded_path,
                 "includeContent": "true",
                 "api-version": "6.0",
             })
