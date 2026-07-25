@@ -120,7 +120,7 @@ def get_space_by_name(name):
             return {"id": item["id"], "slug": item.get("slug")}
     return None
 
-def get_or_create_space(name):
+def get_space(name):
     space = get_space_by_name(name)
     if space:
         print(f"  Using existing space '{name}' (id: {space['id']})")
@@ -178,7 +178,28 @@ def create_page(space_id, title, content, parent_page_id=None):
     return data
 
 
-def find_conflicting_pages(space_id, parent_page_id, files, source_normalized, skip_files):
+def strip_source_segments(wiki_file, n_prefix_segments):
+    """
+    Return the path of wiki_file relative to the source folder, by dropping
+    exactly n_prefix_segments leading path segments.
+
+    We deliberately do NOT compare this against WIKI_SOURCE_PATH as a
+    string: Azure DevOps already scoped the file list to that folder via
+    scopePath, so every file it returns is guaranteed to live inside it.
+    Segment-count stripping avoids false negatives from case differences,
+    trailing slashes, or hyphen-encoding quirks in Azure's own path strings
+    that a plain str.startswith() comparison could miss -- and which used
+    to leave a stray leading folder (e.g. an extra "Vendors") in the
+    imported structure.
+    """
+    segments = [s for s in wiki_file.strip("/").split("/") if s]
+    remaining = segments[n_prefix_segments:]
+    if not remaining:
+        return None
+    return "/".join(remaining)
+
+
+def find_conflicting_pages(space_id, parent_page_id, files, n_prefix_segments, skip_files):
     """
     Dry-run check (read-only, creates nothing): for every file we are about
     to import, walk the destination page tree and see if a page with the
@@ -198,10 +219,8 @@ def find_conflicting_pages(space_id, parent_page_id, files, source_normalized, s
         if wiki_file in skip_files:
             continue
 
-        relative_path = wiki_file.lstrip("/")
-        if source_normalized and relative_path.startswith(source_normalized):
-            relative_path = relative_path[len(source_normalized):]
-        elif source_normalized:
+        relative_path = strip_source_segments(wiki_file, n_prefix_segments)
+        if relative_path is None:
             continue
 
         title = os.path.splitext(os.path.basename(wiki_file))[0]
@@ -236,7 +255,7 @@ def resolve_destination_path(dest_path):
         sys.exit(1)
 
     space_name = parts[0]
-    space = get_or_create_space(space_name)
+    space = get_space(space_name)
     space_id = space["id"]
 
     current_parent_id = None
@@ -315,6 +334,9 @@ def main():
         sys.exit(0)
 
     print(f"Found {len(files)} .md file(s).")
+    print("  Sample of raw Azure paths returned (for sanity-checking):")
+    for f in files[:3]:
+        print(f"    {f}")
 
     print(f"\nConnecting to Docmost ({DOCMOST_URL})...")
     try:
@@ -327,12 +349,16 @@ def main():
     print("\nResolving destination path...")
     space_id, parent_page_id = resolve_destination_path(WIKI_DEST_PATH)
 
-    source_normalized = WIKI_SOURCE_PATH.strip("/") + "/" if WIKI_SOURCE_PATH and not WIKI_SOURCE_PATH.endswith(".md") else WIKI_SOURCE_PATH
+    # Number of path segments that make up the source folder itself -- these
+    # get dropped from every returned file's path to compute where it lands
+    # relative to the destination. Azure DevOps already scoped fetch_wiki_tree()
+    # to this folder, so we trust that scoping rather than re-matching strings.
+    has_source_folder = bool(WIKI_SOURCE_PATH) and not WIKI_SOURCE_PATH.endswith(".md")
+    source_segments = [s for s in WIKI_SOURCE_PATH.strip("/").split("/") if s] if has_source_folder else []
+    n_prefix_segments = len(source_segments)
 
     skip_files = set()
-    if WIKI_SOURCE_PATH and not WIKI_SOURCE_PATH.endswith(".md"):
-        source_clean = WIKI_SOURCE_PATH.strip("/")
-        source_segments = source_clean.split("/")
+    if has_source_folder:
         source_root = source_segments[-1]  # the actual folder being imported
         source_parent_dir = "/".join(source_segments[:-1])  # sibling dir of the companion .md
 
@@ -376,7 +402,7 @@ def main():
                 parent_page_id = new_page["id"]
 
     print("\nChecking for existing pages that would be overwritten...")
-    conflicts = find_conflicting_pages(space_id, parent_page_id, files, source_normalized, skip_files)
+    conflicts = find_conflicting_pages(space_id, parent_page_id, files, n_prefix_segments, skip_files)
     if conflicts:
         print("\nERROR: The following page(s) already exist in Docmost. "
               "Nothing was imported, to avoid overwriting existing content:")
@@ -392,10 +418,8 @@ def main():
             print(f"  Skipping (used as container): {wiki_file}")
             continue
 
-        relative_path = wiki_file.lstrip("/")
-        if source_normalized and relative_path.startswith(source_normalized):
-            relative_path = relative_path[len(source_normalized):]
-        elif source_normalized:
+        relative_path = strip_source_segments(wiki_file, n_prefix_segments)
+        if relative_path is None:
             continue
 
         try:
