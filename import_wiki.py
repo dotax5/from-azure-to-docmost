@@ -2,7 +2,6 @@
 """
 Import Azure DevOps Wiki pages into Docmost
 """
-import io
 import re
 import urllib.parse
 import os
@@ -107,36 +106,52 @@ def fetch_file_content(file_path):
     return data.get("content", "")
 
 
-def download_azure_file(file_path):
-    """Download a binary file from Azure DevOps repo as raw bytes."""
+def stream_azure_file(file_path):
+    """Stream a binary file from Azure DevOps repo.
+    Returns a requests.Response with stream=True. Use resp.raw as a file-like object.
+    If the first request fails with 404, retries with hyphens encoded as %2D."""
     url = f"{AZURE_GIT}/items"
-    params = {
-        "path": file_path,
-        "download": "true",
-        "api-version": "6.0",
-    }
     headers = {"Accept": "application/octet-stream"}
     auth = ("", AZURE_PAT)
-    try:
-        resp = requests.get(url, headers=headers, auth=auth, params=params, timeout=30)
-    except requests.exceptions.RequestException:
-        params["path"] = file_path.replace("-", "%2D")
-        resp = requests.get(url, headers=headers, auth=auth, params=params, timeout=30)
+
+    def _build_url(encoded):
+        if not encoded:
+            return url, {"path": file_path, "download": "true", "api-version": "6.0"}
+        # Manual URL build to avoid requests double-encoding %2D
+        p = urllib.parse.quote(file_path, safe='/').replace('-', '%2D')
+        return f"{url}?download=true&api-version=6.0&path={p}", None
+
+    req_url, req_params = _build_url(encoded=False)
+    resp = requests.get(req_url, headers=headers, auth=auth,
+                        params=req_params, timeout=30, stream=True)
+
     if resp.status_code == 401:
+        resp.close()
         print("ERROR: Azure PAT is invalid or expired.")
         sys.exit(1)
-    resp.raise_for_status()
-    return resp.content
+
+    if not resp.ok:
+        resp.close()
+        req_url, _ = _build_url(encoded=True)
+        resp = requests.get(req_url, headers=headers, auth=auth,
+                            timeout=30, stream=True)
+        if resp.status_code == 401:
+            resp.close()
+            print("ERROR: Azure PAT is invalid or expired.")
+            sys.exit(1)
+        resp.raise_for_status()
+
+    return resp
 
 
-def upload_to_docmost(page_id, file_name, file_data):
-    """Upload a file to Docmost as a page attachment.
-    Returns the Attachment object with 'id', 'fileName', etc."""
+def upload_to_docmost(page_id, file_name, azure_response):
+    """Upload a file to Docmost as a page attachment, streaming from Azure.
+    azure_response is a requests.Response with stream=True (resp.raw will be read)."""
     url = f"{DOCMOST_URL.rstrip('/')}/api/files/upload"
     headers = {
         "Authorization": f"Bearer {DOCMOST_API_KEY}",
     }
-    files = {"file": (file_name, io.BytesIO(file_data))}
+    files = {"file": (file_name, azure_response.raw, "application/octet-stream")}
     data = {"pageId": page_id}
     resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
     if resp.status_code == 401:
@@ -172,19 +187,17 @@ def replace_attachments(md_content, md_path, all_files, page_id):
             continue
 
         file_name = os.path.basename(abs_path)
+        azure_resp = None
         try:
-            file_data = download_azure_file(abs_path)
+            azure_resp = stream_azure_file(abs_path)
+            attachment = upload_to_docmost(page_id, file_name, azure_resp)
         except requests.exceptions.RequestException as e:
-            print(f"    ERROR downloading {ref_path}: {e}")
+            print(f"    ERROR with {file_name}: {e}")
             stats["errors"] += 1
             continue
-
-        try:
-            attachment = upload_to_docmost(page_id, file_name, file_data)
-        except requests.exceptions.RequestException as e:
-            print(f"    ERROR uploading {file_name}: {e}")
-            stats["errors"] += 1
-            continue
+        finally:
+            if azure_resp is not None:
+                azure_resp.close()
 
         attachment_id = attachment.get("id")
         if not attachment_id:
