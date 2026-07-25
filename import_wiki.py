@@ -2,11 +2,11 @@
 """
 Import Azure DevOps Wiki pages into Docmost
 """
+import io
+import re
 import urllib.parse
 import os
 import sys
-from email.quoprimime import quote
-
 from dotenv import load_dotenv
 import requests
 
@@ -60,7 +60,9 @@ def azure_request(path, params=None):
 
 
 def fetch_wiki_tree(path_prefix=""):
-    """Fetch all files from Azure DevOps Wiki repo under given path."""
+    """Fetch all files from Azure DevOps Wiki repo under given path.
+    Returns (md_files_list, all_files_dict) where all_files_dict maps
+    absolute path -> item metadata for every blob (including images, PDFs, etc.)."""
     scope = path_prefix or "/"
     try:
         data = azure_request("items", {
@@ -76,11 +78,17 @@ def fetch_wiki_tree(path_prefix=""):
             "api-version": "6.0",
         })
     items = data.get("value", [])
-    files = []
+    md_files = []
+    all_files = {}
     for item in items:
-        if item.get("gitObjectType") == "blob" and item["path"].endswith(".md"):
-            files.append(urllib.parse.unquote(item["path"]))
-    return sorted(set(files))
+        if item.get("gitObjectType") != "blob":
+            continue
+        path = urllib.parse.unquote(item["path"])
+        if path.endswith(".md"):
+            md_files.append(path)
+        else:
+            all_files[path] = item
+    return sorted(set(md_files)), all_files
 
 
 def fetch_file_content(file_path):
@@ -97,6 +105,99 @@ def fetch_file_content(file_path):
             "api-version": "6.0",
         })
     return data.get("content", "")
+
+
+def download_azure_file(file_path):
+    """Download a binary file from Azure DevOps repo as raw bytes."""
+    url = f"{AZURE_GIT}/items"
+    params = {
+        "path": file_path,
+        "download": "true",
+        "api-version": "6.0",
+    }
+    headers = {"Accept": "application/octet-stream"}
+    auth = ("", AZURE_PAT)
+    try:
+        resp = requests.get(url, headers=headers, auth=auth, params=params, timeout=30)
+    except requests.exceptions.RequestException:
+        params["path"] = file_path.replace("-", "%2D")
+        resp = requests.get(url, headers=headers, auth=auth, params=params, timeout=30)
+    if resp.status_code == 401:
+        print("ERROR: Azure PAT is invalid or expired.")
+        sys.exit(1)
+    resp.raise_for_status()
+    return resp.content
+
+
+def upload_to_docmost(page_id, file_name, file_data):
+    """Upload a file to Docmost as a page attachment.
+    Returns the Attachment object with 'id', 'fileName', etc."""
+    url = f"{DOCMOST_URL.rstrip('/')}/api/files/upload"
+    headers = {
+        "Authorization": f"Bearer {DOCMOST_API_KEY}",
+    }
+    files = {"file": (file_name, io.BytesIO(file_data))}
+    data = {"pageId": page_id}
+    resp = requests.post(url, headers=headers, files=files, data=data, timeout=60)
+    if resp.status_code == 401:
+        print("ERROR: Docmost auth failed.")
+        sys.exit(1)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def replace_attachments(md_content, md_path, all_files, page_id):
+    """Parse markdown for local file references, upload them to Docmost,
+    and replace the old paths with Docmost URLs.
+    Returns (updated_md, stats_dict)."""
+    md_dir = os.path.dirname(md_path)
+    refs = re.findall(r'\[([^\[\]]*)\]\(([^)\s]+)\)', md_content)
+
+    seen = set()
+    stats = {"uploaded": 0, "skipped": 0, "errors": 0}
+
+    for ref_text, ref_path in refs:
+        if ref_path in seen:
+            continue
+        seen.add(ref_path)
+
+        if ref_path.startswith("http://") or ref_path.startswith("https://"):
+            continue
+
+        abs_path = os.path.normpath(os.path.join(md_dir, ref_path)).replace("\\", "/")
+
+        if abs_path not in all_files:
+            print(f"    SKIPPED (not found in Azure): {ref_path}")
+            stats["skipped"] += 1
+            continue
+
+        file_name = os.path.basename(abs_path)
+        try:
+            file_data = download_azure_file(abs_path)
+        except requests.exceptions.RequestException as e:
+            print(f"    ERROR downloading {ref_path}: {e}")
+            stats["errors"] += 1
+            continue
+
+        try:
+            attachment = upload_to_docmost(page_id, file_name, file_data)
+        except requests.exceptions.RequestException as e:
+            print(f"    ERROR uploading {file_name}: {e}")
+            stats["errors"] += 1
+            continue
+
+        attachment_id = attachment.get("id")
+        if not attachment_id:
+            print(f"    ERROR: no 'id' in Docmost response for {file_name}")
+            stats["errors"] += 1
+            continue
+
+        docmost_url = f"/api/files/{attachment_id}/{file_name}"
+        md_content = md_content.replace(f"({ref_path})", f"({docmost_url})")
+        stats["uploaded"] += 1
+        print(f"    Uploaded: {file_name}")
+
+    return md_content, stats
 
 
 # ============================================================
@@ -289,7 +390,7 @@ def resolve_destination_path(dest_path):
     return space_id, current_parent_id
 
 
-def import_file(space_id, parent_page_id, wiki_file_path, relative_path):
+def import_file(space_id, parent_page_id, wiki_file_path, relative_path, all_files):
     """Import a single wiki file into Docmost."""
     title = os.path.splitext(os.path.basename(wiki_file_path))[0]
     content = fetch_file_content(wiki_file_path)
@@ -315,15 +416,27 @@ def import_file(space_id, parent_page_id, wiki_file_path, relative_path):
     existing = find_page_by_title(child_pages, title)
 
     if existing:
-        # We already checked for conflicts before starting the import, so
-        # this should not normally happen. Treat it as a safety net (e.g.
-        # someone/something created the page in the meantime) rather than
-        # silently overwriting anything.
         print(f"  SKIPPED (page already exists, not overwriting): {wiki_file_path}")
         return "skipped"
 
     print(f"  Creating: {wiki_file_path}")
-    create_page(space_id, title, content, parent)
+    page = create_page(space_id, title, content, parent)
+    page_id = page["id"]
+
+    updated_content, attach_stats = replace_attachments(content, wiki_file_path, all_files, page_id)
+
+    if attach_stats["uploaded"] + attach_stats["errors"] > 0:
+        print(f"    Attachments: {attach_stats['uploaded']} uploaded, "
+              f"{attach_stats['skipped']} skipped, {attach_stats['errors']} errors")
+
+    if updated_content != content:
+        docmost_request("POST", "/api/pages/update", {
+            "pageId": page_id,
+            "content": updated_content,
+            "format": "markdown",
+            "operation": "replace",
+        })
+
     return "created"
 
 
@@ -339,7 +452,7 @@ def main():
 
     print("\nFetching wiki file list...")
     try:
-        files = fetch_wiki_tree(WIKI_SOURCE_PATH)
+        files, all_files = fetch_wiki_tree(WIKI_SOURCE_PATH)
     except requests.exceptions.RequestException as e:
         print(f"ERROR: Cannot connect to Azure DevOps: {e}")
         print("Check that AZURE_PAT, AZURE_ORG, AZURE_PROJECT are correct.")
@@ -446,7 +559,7 @@ def main():
             continue
 
         try:
-            result = import_file(space_id, parent_page_id, wiki_file, relative_path)
+            result = import_file(space_id, parent_page_id, wiki_file, relative_path, all_files)
             stats[result] += 1
         except Exception as e:
             print(f"  ERROR on {wiki_file}: {e}")
