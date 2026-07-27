@@ -3,6 +3,7 @@
 Import Azure DevOps Wiki pages into Docmost
 """
 import re
+import json
 import urllib.parse
 import os
 import sys
@@ -18,7 +19,8 @@ load_dotenv()
 AZURE_ORG = os.getenv("AZURE_ORG")
 AZURE_PROJECT = os.getenv("AZURE_PROJECT")
 AZURE_WIKI_REPO = os.getenv("AZURE_WIKI_REPO")
-# Create PAT: https://dev.azure.com/{org}/_usersSettings/tokens (Code -> Read)
+# Create PAT: https://dev.azure.com/{org}/_usersSettings/tokens
+# Needs scopes: Code (Read) for wiki file content, Wiki (Read) for comments
 AZURE_PAT = os.getenv("AZURE_PAT")
 
 # Docmost
@@ -30,6 +32,15 @@ DOCMOST_API_KEY = os.getenv("DOCMOST_API_KEY")
 WIKI_SOURCE_PATH = os.getenv("WIKI_SOURCE_PATH")
 WIKI_SOURCE_PATH = WIKI_SOURCE_PATH.replace(" ", "-")
 WIKI_DEST_PATH = os.getenv("WIKI_DEST_PATH")
+
+# Comments
+# wikiIdentifier used by the Wiki *service* API (different from the git repo
+# name used above for reading raw file content). This is the value that
+# appears in the wiki URL: https://{org}.visualstudio.com/{project}/_wiki/wikis/<THIS>/...
+# If not set, we try AZURE_WIKI_REPO first and fall back to auto-detecting
+# the single wiki registered on the project (see resolve_wiki_identifier()).
+AZURE_WIKI_IDENTIFIER = os.getenv("AZURE_WIKI_IDENTIFIER") or AZURE_WIKI_REPO
+IMPORT_COMMENTS = os.getenv("IMPORT_COMMENTS", "true").strip().lower() not in ("0", "false", "no")
 # ============================================================
 # Azure DevOps API
 # ============================================================
@@ -214,6 +225,148 @@ def replace_attachments(md_content, md_path, all_files, page_id):
 
 
 # ============================================================
+# Azure DevOps Wiki API (page comments)
+#
+# NOTE: this is a *different* API surface from AZURE_GIT above. Page
+# comments belong to the Wiki service, not the git repo, and are addressed
+# by wiki page ID (an integer assigned by the Wiki service), not by git
+# file path. This section is best-effort: it uses the same preview API
+# version ("5.2-preview.1") as Microsoft's own official client library
+# (azure-devops-extension-api), since wiki comments aren't part of the
+# stable/documented REST surface.
+# ============================================================
+
+_wiki_id_cache = {"value": None}
+
+
+def resolve_wiki_identifier():
+    """Figure out the wikiIdentifier for the Wiki *service* API.
+    Tries AZURE_WIKI_IDENTIFIER / AZURE_WIKI_REPO first; if that 404s,
+    lists all wikis on the project and asks the user to pick if ambiguous."""
+    if _wiki_id_cache["value"]:
+        return _wiki_id_cache["value"]
+
+    candidate = AZURE_WIKI_IDENTIFIER
+    if candidate:
+        url = f"{AZURE_BASE}/wiki/wikis/{candidate}"
+        resp = requests.get(url, headers={"Accept": "application/json"},
+                            auth=("", AZURE_PAT), params={"api-version": "7.1"}, timeout=30)
+        if resp.ok:
+            _wiki_id_cache["value"] = candidate
+            return candidate
+
+    # Fall back: list all wikis on the project.
+    url = f"{AZURE_BASE}/wiki/wikis"
+    resp = requests.get(url, headers={"Accept": "application/json"},
+                        auth=("", AZURE_PAT), params={"api-version": "7.1"}, timeout=30)
+    resp.raise_for_status()
+    wikis = resp.json().get("value", [])
+    if not wikis:
+        raise RuntimeError("No wikis found on this project via the Wiki service API.")
+    if len(wikis) == 1:
+        name = wikis[0]["name"]
+        print(f"  Auto-detected wiki identifier: '{name}'")
+        _wiki_id_cache["value"] = name
+        return name
+
+    names = ", ".join(w["name"] for w in wikis)
+    raise RuntimeError(
+        f"Multiple wikis found on this project ({names}). "
+        f"Set AZURE_WIKI_IDENTIFIER in .env to the correct one."
+    )
+
+
+def azure_wiki_request(method, path, params=None, json_body=None):
+    wiki_id = resolve_wiki_identifier()
+    url = f"{AZURE_BASE}/wiki/wikis/{wiki_id}/{path}"
+    headers = {"Accept": "application/json"}
+    auth = ("", AZURE_PAT)
+    resp = requests.request(method, url, headers=headers, auth=auth,
+                            params=params, json=json_body, timeout=30)
+    if resp.status_code == 401:
+        print("ERROR: Azure PAT is invalid or expired.")
+        sys.exit(1)
+    if not resp.ok:
+        # Surface Azure's actual error message instead of a bare status code,
+        # since "400 Bad Request" alone doesn't say *why*.
+        print(f"    Azure Wiki API error {resp.status_code} for {method} {resp.url}")
+        if json_body is not None:
+            print(f"    Request body: {json_body}")
+        print(f"    Response body: {resp.text[:1000]}")
+    resp.raise_for_status()
+    return resp
+
+
+def fetch_wiki_page_map():
+    """Build a map of {normalized git-style path -> wiki page id}.
+
+    Uses the Pages Batch API (POST .../pagesbatch), which returns a flat
+    list of pages that reliably includes 'id' for every page. We tried the
+    recursive "Get Page ... recursionLevel=Full" tree first, but nested
+    subPages entries don't reliably come back with a populated 'id' field
+    -- paths matched fine, ids didn't, so every lookup silently failed.
+    """
+    page_map = {}
+    continuation = None
+    while True:
+        body = {"top": 100}
+        if continuation:
+            body["continuationToken"] = continuation
+        resp = azure_wiki_request("POST", "pagesbatch", params={"api-version": "7.1"}, json_body=body)
+        data = resp.json()
+        for page in data.get("value", []):
+            human_path = page.get("path")
+            page_id = page.get("id")
+            if not human_path or not page_id:
+                continue
+            git_style = ("/" + human_path.strip("/") + ".md").replace(" ", "-")
+            norm_path = normalize_path_for_matching(git_style)
+            if norm_path:
+                page_map[norm_path] = page_id
+        continuation = resp.headers.get("x-ms-continuationtoken")
+        if not continuation:
+            break
+
+    return page_map
+
+
+def normalize_path_for_matching(p):
+    """Normalize a git file path for fuzzy comparison between the Git Items
+    API and the Wiki Pages API. Azure encodes spaces as hyphens in one
+    place and not the other, may leave stray %-encoding, and casing can
+    differ -- so we unquote, lowercase, and collapse hyphens/underscores/
+    spaces all down to a single space before comparing."""
+    if not p:
+        return None
+    p = urllib.parse.unquote(p).strip("/").lower()
+    p = re.sub(r"[-_]+", " ", p)
+    p = re.sub(r"\s+", " ", p)
+    return p
+
+
+def fetch_page_comments(page_id):
+    """Fetch all (non-deleted) comments for a wiki page, oldest first."""
+    comments = []
+    continuation = None
+    while True:
+        params = {
+            "api-version": "5.2-preview.1",
+            "$top": 100,
+            "excludeDeleted": "true",
+            "order": "asc",
+        }
+        if continuation:
+            params["continuationToken"] = continuation
+        resp = azure_wiki_request("GET", f"pages/{page_id}/comments", params=params)
+        body = resp.json()
+        comments.extend(body.get("comments", []))
+        continuation = resp.headers.get("x-ms-continuationtoken")
+        if not continuation:
+            break
+    return comments
+
+
+# ============================================================
 # Docmost API
 # ============================================================
 
@@ -227,6 +380,10 @@ def docmost_request(method, path, json_body=None):
     if resp.status_code == 401:
         print("ERROR: Docmost auth failed. Check DOCMOST_API_KEY (Settings > API keys).")
         sys.exit(1)
+    if not resp.ok:
+        print(f"    Docmost API error {resp.status_code} for {method} {path}")
+        print(f"    Request body: {json_body}")
+        print(f"    Response body: {resp.text[:1000]}")
     resp.raise_for_status()
     ct = resp.headers.get("Content-Type", "")
     if "application/json" not in ct:
@@ -308,19 +465,108 @@ def create_page(space_id, title, content, parent_page_id=None):
     return data
 
 
+def create_comment(page_id, prosemirror_doc, parent_comment_id=None):
+    """Create a comment on a Docmost page. Docmost requires 'content' to be
+    a JSON *string* containing a ProseMirror/Tiptap document (not HTML,
+    and not a raw JSON object -- must be pre-serialized with json.dumps)."""
+    body = {"pageId": page_id, "content": json.dumps(prosemirror_doc)}
+    if parent_comment_id:
+        body["parentCommentId"] = parent_comment_id
+    return docmost_request("POST", "/api/comments/create", body)
+
+
+def _comment_to_prosemirror(comment):
+    """Best-effort rendering of an Azure comment into a minimal ProseMirror
+    doc, prefixed with the original author/date since the Docmost comment
+    will otherwise be attributed to the API key's account instead of the
+    original author."""
+    author = (comment.get("createdBy") or {}).get("displayName") or "Unknown"
+    date = comment.get("createdDate") or comment.get("publishedDate") or ""
+    date = date.split("T")[0] if date else ""
+    text = comment.get("text") or comment.get("content") or ""
+
+    header_content = [{"type": "text", "text": author, "marks": [{"type": "bold"}]}]
+    header_content.append({
+        "type": "text",
+        "text": f" ({date}):" if date else ":",
+    })
+
+    paragraphs = [{"type": "paragraph", "content": header_content}]
+    lines = [line for line in text.splitlines() if line.strip()] or [""]
+    for line in lines:
+        paragraphs.append({
+            "type": "paragraph",
+            "content": [{"type": "text", "text": line}] if line.strip() else [],
+        })
+
+    return {"type": "doc", "content": paragraphs}
+
+
+def import_page_comments(azure_page_id, docmost_page_id):
+    """Fetch all comments for an Azure wiki page and recreate them on the
+    corresponding Docmost page, preserving reply threading where possible."""
+    try:
+        comments = fetch_page_comments(azure_page_id)
+    except requests.exceptions.RequestException as e:
+        print(f"    Comments: ERROR fetching from Azure: {e}")
+        return
+
+    if not comments:
+        return
+
+    comments.sort(key=lambda c: c.get("createdDate") or "")
+
+    id_map = {}  # azure commentId -> docmost commentId
+    remaining = list(comments)
+    created, errors = 0, 0
+    dropped_thread = 0
+
+    while remaining:
+        progress = False
+        still_pending = []
+        for c in remaining:
+            azure_parent = c.get("parentId")
+            if azure_parent and azure_parent not in id_map:
+                still_pending.append(c)
+                continue
+            docmost_parent = id_map.get(azure_parent) if azure_parent else None
+            try:
+                new_comment = create_comment(
+                    docmost_page_id, _comment_to_prosemirror(c), docmost_parent
+                )
+                id_map[c.get("id")] = (new_comment or {}).get("id")
+                created += 1
+            except requests.exceptions.RequestException as e:
+                print(f"    Comments: ERROR creating comment: {e}")
+                errors += 1
+            progress = True
+        if not progress:
+            # Parent(s) failed to create earlier -- post the rest flat
+            # rather than dropping them entirely.
+            for c in still_pending:
+                try:
+                    new_comment = create_comment(docmost_page_id, _comment_to_prosemirror(c))
+                    id_map[c.get("id")] = (new_comment or {}).get("id")
+                    created += 1
+                    dropped_thread += 1
+                except requests.exceptions.RequestException as e:
+                    print(f"    Comments: ERROR creating comment: {e}")
+                    errors += 1
+            break
+        remaining = still_pending
+
+    msg = f"    Comments: {created} imported"
+    if dropped_thread:
+        msg += f" ({dropped_thread} flattened, parent missing)"
+    if errors:
+        msg += f", {errors} errors"
+    print(msg)
+
+
 def strip_source_segments(wiki_file, n_prefix_segments):
     """
     Return the path of wiki_file relative to the source folder, by dropping
     exactly n_prefix_segments leading path segments.
-
-    We deliberately do NOT compare this against WIKI_SOURCE_PATH as a
-    string: Azure DevOps already scoped the file list to that folder via
-    scopePath, so every file it returns is guaranteed to live inside it.
-    Segment-count stripping avoids false negatives from case differences,
-    trailing slashes, or hyphen-encoding quirks in Azure's own path strings
-    that a plain str.startswith() comparison could miss -- and which used
-    to leave a stray leading folder (e.g. an extra "Vendors") in the
-    imported structure.
     """
     segments = [s for s in wiki_file.strip("/").split("/") if s]
     remaining = segments[n_prefix_segments:]
@@ -403,7 +649,7 @@ def resolve_destination_path(dest_path):
     return space_id, current_parent_id
 
 
-def import_file(space_id, parent_page_id, wiki_file_path, relative_path, all_files):
+def import_file(space_id, parent_page_id, wiki_file_path, relative_path, all_files, wiki_page_map=None):
     """Import a single wiki file into Docmost."""
     title = os.path.splitext(os.path.basename(wiki_file_path))[0]
     content = fetch_file_content(wiki_file_path)
@@ -449,6 +695,14 @@ def import_file(space_id, parent_page_id, wiki_file_path, relative_path, all_fil
             "format": "markdown",
             "operation": "replace",
         })
+
+    if wiki_page_map is not None:
+        norm_path = normalize_path_for_matching(wiki_file_path)
+        azure_page_id = wiki_page_map.get(norm_path)
+        if azure_page_id:
+            import_page_comments(azure_page_id, page_id)
+        else:
+            print(f"    Comments: SKIPPED (no matching wiki page found for {wiki_file_path})")
 
     return "created"
 
@@ -561,6 +815,18 @@ def main():
         sys.exit(1)
     print("  No conflicts found.")
 
+    wiki_page_map = None
+    if IMPORT_COMMENTS:
+        print("\nFetching wiki page tree (for comment import)...")
+        try:
+            wiki_page_map = fetch_wiki_page_map()
+            print(f"  Found {len(wiki_page_map)} wiki page(s) with comments lookup available.")
+        except requests.exceptions.RequestException as e:
+            print(f"  WARNING: could not fetch wiki page tree, comments will be skipped: {e}")
+        except RuntimeError as e:
+            print(f"  WARNING: {e}")
+            print("  Comments will be skipped. Set AZURE_WIKI_IDENTIFIER in .env to fix this.")
+
     stats = {"created": 0, "skipped": 0, "errors": 0}
     for wiki_file in files:
         if wiki_file in skip_files:
@@ -572,7 +838,7 @@ def main():
             continue
 
         try:
-            result = import_file(space_id, parent_page_id, wiki_file, relative_path, all_files)
+            result = import_file(space_id, parent_page_id, wiki_file, relative_path, all_files, wiki_page_map)
             stats[result] += 1
         except Exception as e:
             print(f"  ERROR on {wiki_file}: {e}")
