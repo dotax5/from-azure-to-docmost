@@ -754,6 +754,8 @@ def main():
     n_prefix_segments = len(source_segments)
 
     skip_files = set()
+    container_page_id = None
+    container_wiki_path = None
     if has_source_folder:
         source_root = source_segments[-1]  # the actual folder being imported
         source_parent_dir = "/".join(source_segments[:-1])  # sibling dir of the companion .md
@@ -766,6 +768,10 @@ def main():
                 "includeContent": "true",
                 "api-version": "6.0",
             })
+            companion_content = desc_data.get("content", "")
+            if companion_content.strip():
+                print(f"  Found companion page: {companion_path}")
+                skip_files.add(companion_path)
         except requests.exceptions.HTTPError:
             encoded_path = companion_path.replace("-", "%2D")
             desc_data = azure_request("items", {
@@ -791,6 +797,8 @@ def main():
             # so the page resolve_destination_path() already found/created IS
             # the container -- don't create another one nested inside it.
             print(f"  Destination already ends with '{source_root}', using it as the container (no extra nesting).")
+            container_page_id = parent_page_id
+            container_wiki_path = companion_path
         else:
             root_children = list_pages(space_id, parent_page_id)
             found = find_page_by_title(root_children, source_root)
@@ -798,11 +806,15 @@ def main():
                 if companion_content:
                     print(f"  Container '{source_root}' already exists, keeping its current content (not overwriting).")
                 parent_page_id = found["id"]
+                container_page_id = parent_page_id
+                container_wiki_path = companion_path
             else:
                 content = companion_content if companion_content else f"# {source_root}\n\n"
                 print(f"  Creating container page '{source_root}'...")
                 new_page = create_page(space_id, source_root, content, parent_page_id)
                 parent_page_id = new_page["id"]
+                container_page_id = parent_page_id
+                container_wiki_path = companion_path
 
     print("\nChecking for existing pages that would be overwritten...")
     conflicts = find_conflicting_pages(space_id, parent_page_id, files, n_prefix_segments, skip_files)
@@ -826,6 +838,12 @@ def main():
         except RuntimeError as e:
             print(f"  WARNING: {e}")
             print("  Comments will be skipped. Set AZURE_WIKI_IDENTIFIER in .env to fix this.")
+
+    if container_page_id and wiki_page_map is not None and container_wiki_path:
+        norm_container_path = normalize_path_for_matching(container_wiki_path)
+        azure_container_page_id = wiki_page_map.get(norm_container_path)
+        if azure_container_page_id:
+            import_page_comments(azure_container_page_id, container_page_id)
 
     stats = {"created": 0, "skipped": 0, "errors": 0}
     for wiki_file in files:
